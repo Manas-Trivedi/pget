@@ -9,7 +9,14 @@ use std::sync::{Arc, Mutex};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
-    let url = "https://nbg1-speed.hetzner.com/100MB.bin";
+    let args: Vec<String> = std::env::args().collect();
+
+    if args.len() < 2 {
+        println!("Usage: fastdl <url> [-v]");
+        std::process::exit(1);
+    }
+
+    let url = &args[1];
     let client = Client::new();
 
     let resp = client
@@ -18,19 +25,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .send()
         .await?;
 
-    let content_range = resp
-        .headers()
-        .get("content-range")
-        .ok_or("Missing Content-Range")?
-        .to_str()?;
+    let supports_range = resp.status() == reqwest::StatusCode::PARTIAL_CONTENT;
 
-    let file_size: u64 = content_range
-        .split('/')
-        .nth(1)
-        .ok_or("Invalid Content-Range")?
-        .parse()?;
+    let file_size = if supports_range {
+        let content_range = resp
+            .headers()
+            .get("content-range")
+            .ok_or("Missing Content-Range")?
+            .to_str()?;
+
+        content_range
+            .split('/')
+            .nth(1)
+            .ok_or("Invalid Content-Range")?
+            .parse::<u64>()?
+    } else {
+        resp.headers()
+            .get("content-length")
+            .ok_or("Missing Content-Length")?
+            .to_str()?
+            .parse::<u64>()?
+    };
 
     println!("File size: {} bytes", file_size);
+    println!("Range supported: {}", supports_range);
+
+    if !supports_range {
+        println!("Server does not support range requests.");
+        println!("Falling back to single-thread download.");
+        let response = client.get(url).send().await?;
+        let mut stream = response.bytes_stream();
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open("download.bin")
+            .await?;
+        let progress = Arc::new(Mutex::new(0u64));
+        let progress_clone = progress.clone();
+        tokio::spawn(async move {
+            loop {
+                let downloaded = *progress_clone.lock().unwrap();
+                let percent = downloaded as f64 / file_size as f64;
+                let filled = (percent * 30.0).round() as usize;
+                let bar = format!(
+                    "{}{}",
+                    "█".repeat(filled),
+                    "░".repeat(30 - filled)
+                );
+                print!("\r\x1b[2K{}", bar);
+                stdout().flush().unwrap();
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            }
+        });
+        println!("Download complete");
+        return Ok(());
+    }
 
     let chunks = 4;
     let chunk_size = file_size / chunks;
