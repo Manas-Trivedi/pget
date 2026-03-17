@@ -12,12 +12,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let url = "https://nbg1-speed.hetzner.com/100MB.bin";
     let client = Client::new();
 
-    let verbose = std::env::args().any(|a| a == "-v" || a == "--verbose");
+    let resp = client
+        .get(url)
+        .header("Range", "bytes=0-0")
+        .send()
+        .await?;
 
-    let file_size: u64 = 100_000_000;
+    let content_range = resp
+        .headers()
+        .get("content-range")
+        .ok_or("Missing Content-Range")?
+        .to_str()?;
+
+    let file_size: u64 = content_range
+        .split('/')
+        .nth(1)
+        .ok_or("Invalid Content-Range")?
+        .parse()?;
+
+    println!("File size: {} bytes", file_size);
+
     let chunks = 4;
     let chunk_size = file_size / chunks;
 
+    let verbose = std::env::args().any(|a| a == "-v" || a == "--verbose");
     let progress = Arc::new(Mutex::new(vec![0u64; chunks as usize]));
     let progress_clone = progress.clone();
 
