@@ -34,6 +34,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let chunks = 4;
     let chunk_size = file_size / chunks;
+    let max_retries = 5usize;
+    let retry_delay = tokio::time::Duration::from_millis(500);
 
     let verbose = std::env::args().any(|a| a == "-v" || a == "--verbose");
     let progress = Arc::new(Mutex::new(vec![0u64; chunks as usize]));
@@ -137,43 +139,112 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let url = url.to_string();
         let client = client.clone();
         let progress = progress.clone();
+        let retry_delay = retry_delay;
 
         let handle = tokio::spawn(async move {
+            let chunk_len = end - start + 1;
+            let mut downloaded = 0u64;
+            let mut retries = 0usize;
 
-            let response = client
-                .get(&url)
-                .header("Range", format!("bytes={}-{}", start, end))
-                .send()
-                .await
-                .unwrap();
+            while downloaded < chunk_len {
+                let range_start = start + downloaded;
 
-            let mut stream = response.bytes_stream();
+                let response = match client
+                    .get(&url)
+                    .header("Range", format!("bytes={}-{}", range_start, end))
+                    .send()
+                    .await
+                {
+                    Ok(resp) => resp,
+                    Err(err) => {
+                        if retries >= max_retries {
+                            return Err(format!(
+                                "chunk {} failed after {} retries (request): {}",
+                                i, max_retries, err
+                            ));
+                        }
+                        retries += 1;
+                        tokio::time::sleep(retry_delay).await;
+                        continue;
+                    }
+                };
 
-            let mut file = OpenOptions::new()
-                .write(true)
-                .open("download.bin")
-                .await
-                .unwrap();
+                let mut stream = response.bytes_stream();
 
-            file.seek(SeekFrom::Start(start)).await.unwrap();
+                let mut file = match OpenOptions::new().write(true).open("download.bin").await {
+                    Ok(file) => file,
+                    Err(err) => {
+                        if retries >= max_retries {
+                            return Err(format!(
+                                "chunk {} failed after {} retries (open file): {}",
+                                i, max_retries, err
+                            ));
+                        }
+                        retries += 1;
+                        tokio::time::sleep(retry_delay).await;
+                        continue;
+                    }
+                };
 
-            while let Some(item) = stream.next().await {
+                if let Err(err) = file.seek(SeekFrom::Start(range_start)).await {
+                    if retries >= max_retries {
+                        return Err(format!(
+                            "chunk {} failed after {} retries (seek): {}",
+                            i, max_retries, err
+                        ));
+                    }
+                    retries += 1;
+                    tokio::time::sleep(retry_delay).await;
+                    continue;
+                }
 
-                let chunk = item.unwrap();
+                let mut failed_this_attempt = false;
 
-                file.write_all(&chunk).await.unwrap();
+                while let Some(item) = stream.next().await {
+                    let chunk = match item {
+                        Ok(chunk) => chunk,
+                        Err(_) => {
+                            failed_this_attempt = true;
+                            break;
+                        }
+                    };
 
-                let mut p = progress.lock().unwrap();
-                p[i as usize] += chunk.len() as u64;
+                    if let Err(_) = file.write_all(&chunk).await {
+                        failed_this_attempt = true;
+                        break;
+                    }
+
+                    downloaded += chunk.len() as u64;
+
+                    let mut p = progress.lock().unwrap();
+                    p[i as usize] += chunk.len() as u64;
+                }
+
+                if failed_this_attempt {
+                    if retries >= max_retries {
+                        return Err(format!(
+                            "chunk {} failed after {} retries (stream/write)",
+                            i, max_retries
+                        ));
+                    }
+                    retries += 1;
+                    tokio::time::sleep(retry_delay).await;
+                    continue;
+                }
+
+                retries = 0;
             }
 
+            Ok::<(), String>(())
         });
 
         handles.push(handle);
     }
 
     for h in handles {
-        h.await?;
+        h.await
+            .map_err(|e| std::io::Error::other(format!("Chunk task join error: {e}")))?
+            .map_err(std::io::Error::other)?;
     }
 
     // show cursor again
