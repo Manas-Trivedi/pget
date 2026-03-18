@@ -6,6 +6,7 @@ use futures_util::StreamExt;
 use std::io::{stdin, stdout, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use std::collections::VecDeque;
 
 fn filename_from_url(url: &str) -> String {
     url.split('/')
@@ -32,6 +33,20 @@ fn ask_filename(default: &str) -> String {
     }
 }
 
+fn parse_threads(args: &[String]) -> usize {
+    let mut threads = 4;
+
+    for i in 0..args.len() {
+        if args[i] == "-t" || args[i] == "--threads" {
+            if let Some(v) = args.get(i + 1) {
+                threads = v.parse().unwrap_or(4);
+            }
+        }
+    }
+
+    threads.max(1)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
@@ -49,6 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let filename = ask_filename(&default_name);
 
     let verbose = args.iter().any(|a| a == "-v" || a == "--verbose");
+    let chunks = parse_threads(&args);
 
     let client = Client::new();
 
@@ -165,7 +181,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Multi-thread downloader
-    let chunks: usize = 4;
     let chunk_size = file_size / chunks as u64;
 
     let progress = Arc::new(Mutex::new(vec![0u64; chunks]));
@@ -213,22 +228,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
 
                 if verbose {
-
                     lines.push(bar);
                     lines.push(String::new());
-
-                    for (i, chunk_bytes) in p.iter().enumerate() {
-
-                        let percent = *chunk_bytes as f64 / chunk_size as f64;
+                    for (i, worker_bytes) in p.iter().enumerate() {
+                        let percent = if total_downloaded > 0 {
+                            *worker_bytes as f64 / total_downloaded as f64
+                        } else {
+                            0.0
+                        };
                         let filled = (percent * 20.0).round() as usize;
-
                         lines.push(format!(
-                            "Chunk{}: {}{}",
+                            "Worker{}: {}{}  {:.1}MB",
                             i,
                             "█".repeat(filled),
-                            "░".repeat(20 - filled)
+                            "░".repeat(20 - filled),
+                            *worker_bytes as f64 / 1_000_000.0
                         ));
-
                         lines.push(String::new());
                     }
 
@@ -264,51 +279,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut handles = vec![];
 
-    for i in 0..chunks {
+    // create range queue
+    let ranges = Arc::new(Mutex::new(VecDeque::new()));
+    {
+        let mut q = ranges.lock().unwrap();
+        for i in 0..chunks {
+            let start = i as u64 * chunk_size;
+            let end = if i == chunks - 1 {
+                file_size - 1
+            } else {
+                (i as u64 + 1) * chunk_size - 1
+            };
+            q.push_back((start, end));
+        }
+    }
 
-        let start = i as u64 * chunk_size;
-        let end = if i == chunks - 1 {
-            file_size - 1
-        } else {
-            (i as u64 + 1) * chunk_size - 1
-        };
-
+    for worker_id in 0..chunks {
         let url = url.to_string();
         let client = client.clone();
         let progress = progress.clone();
         let filename = filename.clone();
+        let ranges = ranges.clone();
 
         let handle = tokio::spawn(async move {
+            loop {
+                let (start, end) = {
+                    let mut q = ranges.lock().unwrap();
+                    match q.pop_front() {
+                        Some(r) => r,
+                        None => break,
+                    }
+                };
+                let response = client
+                    .get(&url)
+                    .header("Range", format!("bytes={}-{}", start, end))
+                    .send()
+                    .await
+                    .unwrap();
 
-            let response = client
-                .get(&url)
-                .header("Range", format!("bytes={}-{}", start, end))
-                .send()
-                .await
-                .unwrap();
+                let mut stream = response.bytes_stream();
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .open(&filename)
+                    .await
+                    .unwrap();
 
-            let mut stream = response.bytes_stream();
-
-            let mut file = OpenOptions::new()
-                .write(true)
-                .open(&filename)
-                .await
-                .unwrap();
-
-            file.seek(SeekFrom::Start(start)).await.unwrap();
-
-            while let Some(item) = stream.next().await {
-
-                let chunk = item.unwrap();
-
-                file.write_all(&chunk).await.unwrap();
-
-                let mut p = progress.lock().unwrap();
-                p[i] += chunk.len() as u64;
+                file.seek(SeekFrom::Start(start)).await.unwrap();
+                while let Some(item) = stream.next().await {
+                    let chunk = item.unwrap();
+                    file.write_all(&chunk).await.unwrap();
+                    let mut p = progress.lock().unwrap();
+                    p[worker_id] += chunk.len() as u64;
+                }
+                // optional dynamic splitting for large ranges
+                let size = end - start;
+                if size > 2_000_000 {
+                    let mid = start + size / 2;
+                    let mut q = ranges.lock().unwrap();
+                    q.push_back((mid + 1, end));
+                }
             }
 
         });
-
         handles.push(handle);
     }
 
