@@ -43,6 +43,64 @@ Binary path after build:
 ./target/release/pget
 ```
 
+## Install
+
+Prebuilt binaries are available from GitHub Releases.
+
+### Linux (x86_64)
+
+```bash
+curl -L https://github.com/Manas-Trivedi/pget/releases/latest/download/pget-linux-x86_64 \
+	-o pget
+
+chmod +x pget
+sudo mv pget /usr/local/bin/
+```
+
+### macOS (Intel)
+
+```bash
+curl -L https://github.com/Manas-Trivedi/pget/releases/latest/download/pget-macos-x86_64 \
+	-o pget
+
+chmod +x pget
+sudo mv pget /usr/local/bin/
+```
+
+### macOS (Apple Silicon)
+
+```bash
+curl -L https://github.com/Manas-Trivedi/pget/releases/latest/download/pget-macos-arm64 \
+	-o pget
+
+chmod +x pget
+sudo mv pget /usr/local/bin/
+```
+
+### Windows (PowerShell)
+
+```powershell
+curl.exe -L https://github.com/Manas-Trivedi/pget/releases/latest/download/pget-windows-x86_64.exe -o pget.exe
+```
+
+Then add the directory containing `pget.exe` to your `PATH`, or run it directly from the download location.
+
+### Verify installation
+
+macOS / Linux:
+
+```bash
+which pget
+pget --help
+```
+
+Windows (PowerShell):
+
+```powershell
+Get-Command pget
+pget --help
+```
+
 ## Run
 
 ```bash
