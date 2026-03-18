@@ -139,6 +139,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    let completed_count = completed.lock().unwrap().len() as u64;
+    let resumed_bytes = completed_count * PIECE_SIZE;
+
+    if(resumed_bytes > 0) {
+        println!("Resumed: {:.1} MB", resumed_bytes as f64 / 1_000_000.0);
+    }
+
     // Fallback single-thread download
     if !supports_range {
 
@@ -153,7 +160,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .open(&filename)
             .await?;
 
-        let progress = Arc::new(Mutex::new(0u64));
+        let progress = Arc::new(Mutex::new(resumed_bytes));
         let progress_clone = progress.clone();
 
         print!("\x1b[?25l");
@@ -216,6 +223,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let progress = Arc::new(Mutex::new(vec![0u64; chunks]));
+    {
+        let mut p = progress.lock().unwrap();
+        p[0] = resumed_bytes;
+    }
     let progress_clone = progress.clone();
 
     let start_time = Instant::now();
