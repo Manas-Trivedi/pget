@@ -11,7 +11,7 @@ fn filename_from_url(url: &str) -> String {
     url.split('/')
         .last()
         .filter(|s| !s.is_empty())
-        .unwrap_or("&filename")
+        .unwrap_or("download.bin")
         .to_string()
 }
 
@@ -46,7 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let default_name = filename_from_url(url);
     println!("Detected filename: {}", default_name);
-    let _filename = ask_filename(&default_name);
+    let filename = ask_filename(&default_name);
 
     let verbose = args.iter().any(|a| a == "-v" || a == "--verbose");
 
@@ -99,7 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut file = OpenOptions::new()
             .create(true)
             .write(true)
-            .open("&filename")
+            .open(&filename)
             .await?;
 
         let progress = Arc::new(Mutex::new(0u64));
@@ -253,6 +253,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     });
 
+    // create file and preallocate size
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&filename)
+        .await?;
+
+    file.set_len(file_size).await?;
+
     let mut handles = vec![];
 
     for i in 0..chunks {
@@ -267,6 +276,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let url = url.to_string();
         let client = client.clone();
         let progress = progress.clone();
+        let filename = filename.clone();
 
         let handle = tokio::spawn(async move {
 
@@ -280,9 +290,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut stream = response.bytes_stream();
 
             let mut file = OpenOptions::new()
-                .create(true)
                 .write(true)
-                .open("&filename")
+                .open(&filename)
                 .await
                 .unwrap();
 
