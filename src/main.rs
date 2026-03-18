@@ -3,9 +3,34 @@ use tokio::fs::OpenOptions;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use std::io::SeekFrom;
 use futures_util::StreamExt;
-use std::io::{stdout, Write};
+use std::io::{stdin, stdout, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+
+fn filename_from_url(url: &str) -> String {
+    url.split('/')
+        .last()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("&filename")
+        .to_string()
+}
+
+fn ask_filename(default: &str) -> String {
+
+    print!("Rename file? [press Enter to keep] [{}]: ", default);
+    stdout().flush().unwrap();
+
+    let mut input = String::new();
+    stdin().read_line(&mut input).unwrap();
+
+    let trimmed = input.trim();
+
+    if trimmed.is_empty() {
+        default.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -13,11 +38,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
 
     if args.len() < 2 {
-        println!("Usage: fastdl <url> [-v]");
+        println!("Usage: pget <url> [-v]");
         std::process::exit(1);
     }
 
     let url = &args[1];
+
+    let default_name = filename_from_url(url);
+    println!("Detected filename: {}", default_name);
+    let _filename = ask_filename(&default_name);
+
     let verbose = args.iter().any(|a| a == "-v" || a == "--verbose");
 
     let client = Client::new();
@@ -69,7 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut file = OpenOptions::new()
             .create(true)
             .write(true)
-            .open("download.bin")
+            .open("&filename")
             .await?;
 
         let progress = Arc::new(Mutex::new(0u64));
@@ -252,7 +282,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut file = OpenOptions::new()
                 .create(true)
                 .write(true)
-                .open("download.bin")
+                .open("&filename")
                 .await
                 .unwrap();
 
