@@ -7,8 +7,13 @@ use std::io::{stdin, stdout, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use std::collections::{VecDeque, HashSet};
+use colored::*;
 
 const PIECE_SIZE: u64 = 4 * 1024 * 1024; // 4MB
+
+fn log(msg: &str) {
+    println!("{} {}", "pget".bright_cyan().bold(), msg);
+}
 
 fn filename_from_url(url: &str) -> String {
     url.split('/')
@@ -77,7 +82,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let url = &args[1];
 
     let default_name = filename_from_url(url);
-    println!("Detected filename: {}", default_name);
+    log(&format!("Detected filename: {}", default_name));
     let filename = ask_filename(&default_name);
 
     let meta_file = format!("{}.pget", filename);
@@ -121,8 +126,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     };
 
-    println!("File size: {} bytes", file_size);
-    println!("Range supported: {}", supports_range);
+    log(&format!("File size: {} bytes", file_size));
+    log(&format!("Range supported: {}", supports_range));
 
     // load previous state if exists
     if let Ok(content) = std::fs::read_to_string(&meta_file) {
@@ -142,8 +147,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let completed_count = completed.lock().unwrap().len() as u64;
     let resumed_bytes = completed_count * PIECE_SIZE;
 
-    if(resumed_bytes > 0) {
-        println!("Resumed: {:.1} MB", resumed_bytes as f64 / 1_000_000.0);
+    if resumed_bytes > 0 {
+        log(&format!("Resumed: {:.1} MB", resumed_bytes as f64 / 1_000_000.0));
     }
 
     // Fallback single-thread download
