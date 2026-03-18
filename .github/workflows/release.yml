@@ -1,0 +1,40 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            name: pget-linux-x86_64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            name: pget-macos-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            name: pget-macos-arm64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            name: pget-windows-x86_64.exe
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/${{ matrix.target }}/release/pget*
