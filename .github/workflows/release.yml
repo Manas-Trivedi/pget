@@ -5,6 +5,9 @@ on:
     tags:
       - "v*"
 
+permissions:
+  contents: write
+
 jobs:
   build:
     strategy:
@@ -12,29 +15,47 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
+            artifact: pget
             name: pget-linux-x86_64
+
           - os: macos-latest
             target: x86_64-apple-darwin
+            artifact: pget
             name: pget-macos-x86_64
+
           - os: macos-latest
             target: aarch64-apple-darwin
+            artifact: pget
             name: pget-macos-arm64
+
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            artifact: pget.exe
             name: pget-windows-x86_64.exe
 
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - run: cargo build --release --target ${{ matrix.target }}
+      - name: Install musl tools (Linux only)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
-      - name: Upload release asset
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Rename binary
+        run: |
+          cp target/${{ matrix.target }}/release/${{ matrix.artifact }} ${{ matrix.name }}
+
+      - name: Upload Release Asset
         uses: softprops/action-gh-release@v2
         with:
-          files: target/${{ matrix.target }}/release/pget*
+          files: ${{ matrix.name }}
