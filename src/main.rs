@@ -6,7 +6,7 @@ use futures_util::StreamExt;
 use std::io::{stdin, stdout, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use std::collections::VecDeque;
+use std::collections::{VecDeque, HashSet};
 
 const PIECE_SIZE: u64 = 4 * 1024 * 1024; // 4MB
 
@@ -49,6 +49,21 @@ fn parse_threads(args: &[String]) -> usize {
     threads.max(1)
 }
 
+fn save_state(meta_file: &str, completed: &HashSet<u64>, file_size: u64) {
+
+    let mut list: Vec<String> = completed.iter().map(|v| v.to_string()).collect();
+    list.sort();
+
+    let data = format!(
+        "file_size={}\npiece_size={}\ncompleted={}",
+        file_size,
+        PIECE_SIZE,
+        list.join(",")
+    );
+
+    let _ = std::fs::write(meta_file, data);
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
@@ -64,6 +79,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let default_name = filename_from_url(url);
     println!("Detected filename: {}", default_name);
     let filename = ask_filename(&default_name);
+
+    let meta_file = format!("{}.pget", filename);
+    let completed = Arc::new(Mutex::new(HashSet::<u64>::new()));
 
     let verbose = args.iter().any(|a| a == "-v" || a == "--verbose");
     let chunks = parse_threads(&args);
@@ -105,6 +123,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("File size: {} bytes", file_size);
     println!("Range supported: {}", supports_range);
+
+    // load previous state if exists
+    if let Ok(content) = std::fs::read_to_string(&meta_file) {
+        println!("Resuming previous download");
+        for line in content.lines() {
+            if line.starts_with("completed=") {
+                let pieces = line.replace("completed=", "");
+                for p in pieces.split(',') {
+                    if let Ok(id) = p.parse::<u64>() {
+                        completed.lock().unwrap().insert(id);
+                    }
+                }
+            }
+        }
+    }
 
     // Fallback single-thread download
     if !supports_range {
@@ -276,17 +309,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     file.set_len(file_size).await?;
 
+    let completed_ctrl = completed.clone();
+    let meta_ctrl = meta_file.clone();
+
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.unwrap();
+        println!("\nInterrupted. Saving progress...");
+        save_state(&meta_ctrl, &completed_ctrl.lock().unwrap(), file_size);
+        print!("\x1b[?25h");
+        stdout().flush().unwrap();
+        std::process::exit(0);
+    });
+
     let mut handles = vec![];
 
     // create range queue
-    let ranges = Arc::new(Mutex::new(VecDeque::new()));
+    let ranges = Arc::new(Mutex::new(VecDeque::<(u64,u64,u64)>::new()));
     {
         let mut q = ranges.lock().unwrap();
         let mut start = 0;
+        let mut piece_index = 0;
+        let completed_guard = completed.lock().unwrap();
         while start < file_size {
             let end = (start + PIECE_SIZE - 1).min(file_size - 1);
-            q.push_back((start, end));
+            if !completed_guard.contains(&piece_index) {
+                q.push_back((piece_index, start, end));
+            }
             start += PIECE_SIZE;
+            piece_index += 1;
         }
     }
 
@@ -296,10 +346,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let progress = progress.clone();
         let filename = filename.clone();
         let ranges = ranges.clone();
+        let completed = completed.clone();
+        let meta_file = meta_file.clone();
 
         let handle = tokio::spawn(async move {
             loop {
-                let (start, end) = {
+                let (piece_index, start, end) = {
                     let mut q = ranges.lock().unwrap();
                     match q.pop_front() {
                         Some(r) => r,
@@ -327,6 +379,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let mut p = progress.lock().unwrap();
                     p[worker_id] += chunk.len() as u64;
                 }
+                completed.lock().unwrap().insert(piece_index);
+                save_state(&meta_file, &completed.lock().unwrap(), file_size);
             }
 
         });
@@ -339,6 +393,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     print!("\x1b[?25h");
     stdout().flush().unwrap();
+
+    let _ = std::fs::remove_file(meta_file);
 
     println!("\nDownload complete");
 
