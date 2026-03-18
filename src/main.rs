@@ -8,6 +8,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use std::collections::VecDeque;
 
+const PIECE_SIZE: u64 = 4 * 1024 * 1024; // 4MB
+
 fn filename_from_url(url: &str) -> String {
     url.split('/')
         .last()
@@ -180,9 +182,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // Multi-thread downloader
-    let chunk_size = file_size / chunks as u64;
-
     let progress = Arc::new(Mutex::new(vec![0u64; chunks]));
     let progress_clone = progress.clone();
 
@@ -283,14 +282,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ranges = Arc::new(Mutex::new(VecDeque::new()));
     {
         let mut q = ranges.lock().unwrap();
-        for i in 0..chunks {
-            let start = i as u64 * chunk_size;
-            let end = if i == chunks - 1 {
-                file_size - 1
-            } else {
-                (i as u64 + 1) * chunk_size - 1
-            };
+        let mut start = 0;
+        while start < file_size {
+            let end = (start + PIECE_SIZE - 1).min(file_size - 1);
             q.push_back((start, end));
+            start += PIECE_SIZE;
         }
     }
 
@@ -330,13 +326,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     file.write_all(&chunk).await.unwrap();
                     let mut p = progress.lock().unwrap();
                     p[worker_id] += chunk.len() as u64;
-                }
-                // optional dynamic splitting for large ranges
-                let size = end - start;
-                if size > 2_000_000 {
-                    let mid = start + size / 2;
-                    let mut q = ranges.lock().unwrap();
-                    q.push_back((mid + 1, end));
                 }
             }
 
