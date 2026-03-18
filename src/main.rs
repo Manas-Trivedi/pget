@@ -131,7 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // load previous state if exists
     if let Ok(content) = std::fs::read_to_string(&meta_file) {
-        println!("Resuming previous download");
+        log("Resuming previous download");
         for line in content.lines() {
             if line.starts_with("completed=") {
                 let pieces = line.replace("completed=", "");
@@ -154,7 +154,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Fallback single-thread download
     if !supports_range {
 
-        println!("Falling back to single-thread download.");
+        log("Server does not support range requests — falling back to single-thread download");
 
         let response = client.get(url).send().await?;
         let mut stream = response.bytes_stream();
@@ -242,11 +242,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Renderer
     tokio::spawn(async move {
-
         loop {
-
             let elapsed = start_time.elapsed().as_secs_f64();
-
             let lines = {
                 let p = progress_clone.lock().unwrap();
                 let mut lines = Vec::new();
@@ -330,7 +327,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tokio::spawn(async move {
         tokio::signal::ctrl_c().await.unwrap();
-        println!("\nInterrupted. Saving progress...");
+        println!();
+        log("Interrupted — saving progress");
         save_state(&meta_ctrl, &completed_ctrl.lock().unwrap(), file_size);
         print!("\x1b[?25h");
         stdout().flush().unwrap();
