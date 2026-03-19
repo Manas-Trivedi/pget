@@ -3,15 +3,23 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use std::collections::{HashSet, VecDeque};
 use std::io::SeekFrom;
+use std::io::{Error as IoError, ErrorKind};
 use std::io::{Write, stdin, stdout};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tokio::time::timeout;
 
 const PIECE_SIZE: u64 = 4 * 1024 * 1024; // 4MB
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_RETRIES: usize = 3;
+const RETRY_BACKOFF_BASE_MS: u64 = 500;
+
+type AppResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 fn log(msg: &str) {
     println!("{} {}", "pget".bright_cyan().bold(), msg);
@@ -79,12 +87,12 @@ fn parse_args(args: &[String]) -> Result<CliArgs, String> {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--help" => {
+            "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
             }
             "--version" => {
-                println!("pget {}", VERSION);
+                log(&format!("{}", VERSION));
                 std::process::exit(0);
             }
             "-v" | "--verbose" => {
@@ -248,8 +256,297 @@ fn save_state(meta_file: &str, completed: &HashSet<u64>, file_size: u64) {
     let _ = std::fs::write(meta_file, data);
 }
 
+fn app_error(message: impl Into<String>) -> Box<dyn std::error::Error + Send + Sync> {
+    Box::new(IoError::other(message.into()))
+}
+
+fn retry_delay(attempt: usize) -> Duration {
+    let exponent = attempt.saturating_sub(1).min(5) as u32;
+    Duration::from_millis(RETRY_BACKOFF_BASE_MS.saturating_mul(2u64.pow(exponent)))
+}
+
+fn timeout_error(context: &str) -> Box<dyn std::error::Error + Send + Sync> {
+    Box::new(IoError::new(
+        ErrorKind::TimedOut,
+        format!("{context} timed out after {}s", REQUEST_TIMEOUT.as_secs()),
+    ))
+}
+
+async fn send_request(
+    client: &Client,
+    url: &str,
+    range: Option<(u64, u64)>,
+    context: &str,
+) -> AppResult<reqwest::Response> {
+    let mut last_error: Option<Box<dyn std::error::Error + Send + Sync>> = None;
+
+    for attempt in 1..=MAX_RETRIES {
+        let mut request = client.get(url);
+        if let Some((start, end)) = range {
+            request = request.header("Range", format!("bytes={start}-{end}"));
+        }
+
+        match timeout(REQUEST_TIMEOUT, request.send()).await {
+            Ok(Ok(response)) => match response.error_for_status() {
+                Ok(response) => return Ok(response),
+                Err(err) => last_error = Some(Box::new(err)),
+            },
+            Ok(Err(err)) => last_error = Some(Box::new(err)),
+            Err(_) => last_error = Some(timeout_error(context)),
+        }
+
+        if attempt < MAX_RETRIES {
+            let delay = retry_delay(attempt);
+            log(&format!(
+                "{context} failed (attempt {attempt}/{MAX_RETRIES}). Retrying in {:.1}s...",
+                delay.as_secs_f64()
+            ));
+            tokio::time::sleep(delay).await;
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| app_error(format!("{context} failed"))))
+}
+
+async fn probe_server(client: &Client, url: &str) -> AppResult<(bool, u64)> {
+    let resp = send_request(client, url, Some((0, 0)), "Range probe").await?;
+    let supports_range = resp.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+
+    let file_size = if supports_range {
+        let content_range = resp
+            .headers()
+            .get("content-range")
+            .ok_or_else(|| app_error("Missing Content-Range"))?
+            .to_str()?;
+
+        content_range
+            .split('/')
+            .nth(1)
+            .ok_or_else(|| app_error("Invalid Content-Range"))?
+            .parse::<u64>()?
+    } else {
+        resp.headers()
+            .get("content-length")
+            .ok_or_else(|| app_error("Missing Content-Length"))?
+            .to_str()?
+            .parse::<u64>()?
+    };
+
+    Ok((supports_range, file_size))
+}
+
+async fn download_single_stream(
+    client: &Client,
+    url: &str,
+    filename: &str,
+    file_size: u64,
+    progress: Arc<Mutex<u64>>,
+) -> AppResult<()> {
+    let mut last_error: Option<Box<dyn std::error::Error + Send + Sync>> = None;
+
+    for attempt in 1..=MAX_RETRIES {
+        {
+            let mut current = progress.lock().unwrap();
+            *current = 0;
+        }
+
+        let response = match send_request(client, url, None, "Single-stream request").await {
+            Ok(response) => response,
+            Err(err) => {
+                last_error = Some(err);
+                if attempt < MAX_RETRIES {
+                    let delay = retry_delay(attempt);
+                    log(&format!(
+                        "Single-stream download failed (attempt {attempt}/{MAX_RETRIES}). Retrying in {:.1}s...",
+                        delay.as_secs_f64()
+                    ));
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                break;
+            }
+        };
+
+        let mut stream = response.bytes_stream();
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(filename)
+            .await?;
+
+        let mut failed = None;
+
+        loop {
+            match timeout(REQUEST_TIMEOUT, stream.next()).await {
+                Ok(Some(Ok(chunk))) => {
+                    if let Err(err) = file.write_all(&chunk).await {
+                        failed = Some(Box::new(err) as Box<dyn std::error::Error + Send + Sync>);
+                        break;
+                    }
+
+                    let mut current = progress.lock().unwrap();
+                    *current += chunk.len() as u64;
+                }
+                Ok(Some(Err(err))) => {
+                    failed = Some(Box::new(err));
+                    break;
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    failed = Some(timeout_error("Single-stream response body"));
+                    break;
+                }
+            }
+        }
+
+        if let Some(err) = failed {
+            last_error = Some(err);
+            if attempt < MAX_RETRIES {
+                let delay = retry_delay(attempt);
+                log(&format!(
+                    "Single-stream download stalled or failed (attempt {attempt}/{MAX_RETRIES}). Retrying in {:.1}s...",
+                    delay.as_secs_f64()
+                ));
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+            break;
+        }
+
+        let downloaded = *progress.lock().unwrap();
+        if downloaded == file_size {
+            return Ok(());
+        }
+
+        last_error = Some(app_error(format!(
+            "Single-stream download ended early ({downloaded}/{file_size} bytes)"
+        )));
+
+        if attempt < MAX_RETRIES {
+            let delay = retry_delay(attempt);
+            log(&format!(
+                "Single-stream download ended early (attempt {attempt}/{MAX_RETRIES}). Retrying in {:.1}s...",
+                delay.as_secs_f64()
+            ));
+            tokio::time::sleep(delay).await;
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| app_error("Single-stream download failed")))
+}
+
+async fn download_piece(
+    client: &Client,
+    url: &str,
+    filename: &str,
+    worker_id: usize,
+    progress: Arc<Mutex<Vec<u64>>>,
+    piece_index: u64,
+    start: u64,
+    end: u64,
+) -> AppResult<()> {
+    let expected_len = end - start + 1;
+    let mut last_error: Option<Box<dyn std::error::Error + Send + Sync>> = None;
+
+    for attempt in 1..=MAX_RETRIES {
+        let context = format!("Worker {worker_id} piece {piece_index}");
+        let response = match send_request(client, url, Some((start, end)), &context).await {
+            Ok(response) => response,
+            Err(err) => {
+                last_error = Some(err);
+                if attempt < MAX_RETRIES {
+                    let delay = retry_delay(attempt);
+                    log(&format!(
+                        "{context} failed (attempt {attempt}/{MAX_RETRIES}). Retrying in {:.1}s...",
+                        delay.as_secs_f64()
+                    ));
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                break;
+            }
+        };
+
+        if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+            last_error = Some(app_error(format!(
+                "{context} expected 206 Partial Content, got {}",
+                response.status()
+            )));
+            if attempt < MAX_RETRIES {
+                let delay = retry_delay(attempt);
+                log(&format!(
+                    "{context} returned an unexpected response (attempt {attempt}/{MAX_RETRIES}). Retrying in {:.1}s...",
+                    delay.as_secs_f64()
+                ));
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+            break;
+        }
+
+        let mut stream = response.bytes_stream();
+        let mut file = OpenOptions::new().write(true).open(filename).await?;
+        file.seek(SeekFrom::Start(start)).await?;
+
+        let mut downloaded_this_attempt = 0u64;
+        let mut failed = None;
+
+        loop {
+            match timeout(REQUEST_TIMEOUT, stream.next()).await {
+                Ok(Some(Ok(chunk))) => {
+                    if let Err(err) = file.write_all(&chunk).await {
+                        failed = Some(Box::new(err) as Box<dyn std::error::Error + Send + Sync>);
+                        break;
+                    }
+
+                    downloaded_this_attempt += chunk.len() as u64;
+                    let mut p = progress.lock().unwrap();
+                    p[worker_id] += chunk.len() as u64;
+                }
+                Ok(Some(Err(err))) => {
+                    failed = Some(Box::new(err));
+                    break;
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    failed = Some(timeout_error(&format!("{context} body")));
+                    break;
+                }
+            }
+        }
+
+        if failed.is_none() && downloaded_this_attempt == expected_len {
+            return Ok(());
+        }
+
+        {
+            let mut p = progress.lock().unwrap();
+            p[worker_id] = p[worker_id].saturating_sub(downloaded_this_attempt);
+        }
+
+        last_error = Some(failed.unwrap_or_else(|| {
+            app_error(format!(
+                "{context} ended early ({downloaded_this_attempt}/{expected_len} bytes)"
+            ))
+        }));
+
+        if attempt < MAX_RETRIES {
+            let delay = retry_delay(attempt);
+            log(&format!(
+                "{context} was incomplete (attempt {attempt}/{MAX_RETRIES}). Retrying in {:.1}s...",
+                delay.as_secs_f64()
+            ));
+            tokio::time::sleep(delay).await;
+        }
+    }
+
+    Err(last_error
+        .unwrap_or_else(|| app_error(format!("Worker {worker_id} piece {piece_index} failed"))))
+}
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> AppResult<()> {
     let args: Vec<String> = std::env::args().collect();
     let cli = match parse_args(&args) {
         Ok(cli) => cli,
@@ -281,32 +578,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let verbose = cli.verbose;
     let chunks = cli.threads;
 
-    let client = Client::new();
+    let client = Client::builder().connect_timeout(CONNECT_TIMEOUT).build()?;
 
-    // Probe server with range request
-    let resp = client.get(&url).header("Range", "bytes=0-0").send().await?;
-
-    let supports_range = resp.status() == reqwest::StatusCode::PARTIAL_CONTENT;
-
-    let file_size = if supports_range {
-        let content_range = resp
-            .headers()
-            .get("content-range")
-            .ok_or("Missing Content-Range")?
-            .to_str()?;
-
-        content_range
-            .split('/')
-            .nth(1)
-            .ok_or("Invalid Content-Range")?
-            .parse::<u64>()?
-    } else {
-        resp.headers()
-            .get("content-length")
-            .ok_or("Missing Content-Length")?
-            .to_str()?
-            .parse::<u64>()?
-    };
+    let (supports_range, file_size) = probe_server(&client, &url).await?;
 
     log(&format!("File size: {} bytes", file_size));
     log(&format!("Range supported: {}", supports_range));
@@ -340,16 +614,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !supports_range {
         log("Server does not support range requests — falling back to single-thread download");
 
-        let response = client.get(&url).send().await?;
-        let mut stream = response.bytes_stream();
-
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .open(&filename)
-            .await?;
-
-        let progress = Arc::new(Mutex::new(resumed_bytes));
+        let progress = Arc::new(Mutex::new(0u64));
         let progress_clone = progress.clone();
 
         print!("\x1b[?25l");
@@ -391,12 +656,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
 
-        while let Some(item) = stream.next().await {
-            let chunk = item?;
-            file.write_all(&chunk).await?;
-
-            let mut p = progress.lock().unwrap();
-            *p += chunk.len() as u64;
+        if let Err(err) =
+            download_single_stream(&client, &url, &filename, file_size, progress).await
+        {
+            print!("\x1b[?25h");
+            stdout().flush().unwrap();
+            return Err(app_error(format!("Download failed: {err}")));
         }
 
         print!("\x1b[?25h");
@@ -502,13 +767,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let meta_ctrl = meta_file.clone();
 
     tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.unwrap();
-        println!();
-        log("Interrupted — saving progress");
-        save_state(&meta_ctrl, &completed_ctrl.lock().unwrap(), file_size);
-        print!("\x1b[?25h");
-        stdout().flush().unwrap();
-        std::process::exit(0);
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => {
+                println!();
+                log("Interrupted — saving progress");
+                save_state(&meta_ctrl, &completed_ctrl.lock().unwrap(), file_size);
+                print!("\x1b[?25h");
+                stdout().flush().unwrap();
+                std::process::exit(0);
+            }
+            Err(err) => {
+                eprintln!("Failed to listen for Ctrl+C: {err}");
+            }
+        }
     });
 
     let mut handles = vec![];
@@ -548,36 +819,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         None => break,
                     }
                 };
-                let response = client
-                    .get(&url)
-                    .header("Range", format!("bytes={}-{}", start, end))
-                    .send()
-                    .await
-                    .unwrap();
+                download_piece(
+                    &client,
+                    &url,
+                    &filename,
+                    worker_id,
+                    progress.clone(),
+                    piece_index,
+                    start,
+                    end,
+                )
+                .await?;
 
-                let mut stream = response.bytes_stream();
-                let mut file = OpenOptions::new()
-                    .write(true)
-                    .open(&filename)
-                    .await
-                    .unwrap();
-
-                file.seek(SeekFrom::Start(start)).await.unwrap();
-                while let Some(item) = stream.next().await {
-                    let chunk = item.unwrap();
-                    file.write_all(&chunk).await.unwrap();
-                    let mut p = progress.lock().unwrap();
-                    p[worker_id] += chunk.len() as u64;
-                }
                 completed.lock().unwrap().insert(piece_index);
                 save_state(&meta_file, &completed.lock().unwrap(), file_size);
             }
+            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
         });
         handles.push(handle);
     }
 
-    for h in handles {
-        h.await?;
+    while let Some(handle) = handles.pop() {
+        match handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                for pending in handles {
+                    pending.abort();
+                }
+                save_state(&meta_file, &completed.lock().unwrap(), file_size);
+                print!("\x1b[?25h");
+                stdout().flush().unwrap();
+                return Err(app_error(format!(
+                    "Download failed after retries. Saved progress to {}: {err}",
+                    meta_file
+                )));
+            }
+            Err(err) => {
+                for pending in handles {
+                    pending.abort();
+                }
+                save_state(&meta_file, &completed.lock().unwrap(), file_size);
+                print!("\x1b[?25h");
+                stdout().flush().unwrap();
+                return Err(app_error(format!(
+                    "A worker task crashed. Saved progress to {}: {err}",
+                    meta_file
+                )));
+            }
+        }
     }
 
     print!("\x1b[?25h");

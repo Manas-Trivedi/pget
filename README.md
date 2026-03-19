@@ -20,6 +20,8 @@ The CLI provides a live progress renderer (throughput and ETA), interactive or n
 - Piece-based scheduling (`4 MiB` pieces) for balanced worker utilization
 - Resume support for segmented downloads via persisted sidecar state (`<filename>.pget`)
 - Interrupt handling (`Ctrl+C`) with on-exit progress state persistence
+- Request retries with exponential backoff for probe, single-stream, and ranged piece requests
+- Request/connect timeout handling to avoid indefinite hangs on stalled connections
 - Live progress telemetry:
 	- bytes transferred
 	- effective throughput
@@ -264,7 +266,7 @@ cargo clippy --all-targets --all-features
 ## Todo
 
 - [x] Improve CLI ergonomics: add `--output/-o`, `--no-prompt`, and fuller `--help`
-- [ ] Harden reliability: retries with backoff, request timeouts, and graceful error handling
+- [x] Harden reliability: retries with backoff, request timeouts, and graceful error handling
 - [ ] Strengthen resume safety: store/validate `ETag` or `Last-Modified` in `.pget` state
 - [ ] Add integrity checks: optional `--checksum` verification after download
 - [ ] Expand transfer controls: `--limit-rate`, overwrite/skip policies, explicit continue modes
