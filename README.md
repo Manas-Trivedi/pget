@@ -12,7 +12,7 @@ The CLI provides a live progress renderer (throughput and ETA), interactive outp
 ## Features
 
 - Automatic output filename derivation from URL path
-- Interactive output filename override
+- Interactive output filename override with validation and overwrite confirmation
 - Automatic range capability detection via `Range: bytes=0-0` probe
 - Segmented parallel transfer mode with configurable worker count
 - Single-stream fallback mode for non-range endpoints
@@ -148,10 +148,13 @@ If a matching `<filename>.pget` state file exists, `pget` reloads completed piec
 ## CLI Behavior
 
 1. Derives a default output filename from the input URL.
-2. Prompts for optional filename override:
+2. Prompts for output filename with guided rename UX:
 
 	```text
-	Rename file? [press Enter to keep] [detected-name]:
+	Output filename
+	  Press Enter to keep: detected-name
+	  Type a new filename to rename
+	Save as [detected-name]:
 	```
 
 3. Probes server byte-range support.
@@ -160,6 +163,13 @@ If a matching `<filename>.pget` state file exists, `pget` reloads completed piec
 6. If interrupted in segmented mode, persists completed piece indices to `<filename>.pget`.
 7. On restart, reloads sidecar state and skips completed pieces.
 8. Renders progress continuously until completion and removes the sidecar state file when done.
+
+Rename prompt behavior:
+
+- Empty input keeps the detected filename.
+- Invalid names (for example `.`, `..`, directory paths, or names containing `/`) are rejected and re-prompted.
+- If the target file already exists and no matching state file is present, `pget` asks for overwrite confirmation (`[y/N]`).
+- If both target file and matching state file exist, `pget` assumes resume mode for that filename.
 
 ## Usage Summary
 

@@ -7,6 +7,7 @@ use std::io::{stdin, stdout, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use std::collections::{VecDeque, HashSet};
+use std::path::Path;
 use colored::*;
 
 const PIECE_SIZE: u64 = 4 * 1024 * 1024; // 4MB
@@ -24,19 +25,61 @@ fn filename_from_url(url: &str) -> String {
 }
 
 fn ask_filename(default: &str) -> String {
+    println!("{}", "\nOutput filename".bright_white().bold());
+    println!("  Press Enter to keep: {}", default.bright_green());
+    println!("  Type a new filename to rename");
 
-    print!("Rename file? [press Enter to keep] [{}]: ", default);
-    stdout().flush().unwrap();
+    loop {
+        print!("Save as [{}]: ", default);
+        stdout().flush().unwrap();
 
-    let mut input = String::new();
-    stdin().read_line(&mut input).unwrap();
+        let mut input = String::new();
+        stdin().read_line(&mut input).unwrap();
 
-    let trimmed = input.trim();
+        let candidate = if input.trim().is_empty() {
+            default.to_string()
+        } else {
+            input.trim().to_string()
+        };
 
-    if trimmed.is_empty() {
-        default.to_string()
-    } else {
-        trimmed.to_string()
+        if candidate == "." || candidate == ".." {
+            println!("{}", "Please enter a valid filename.".yellow());
+            continue;
+        }
+
+        if candidate.contains('/') || candidate.contains('\0') {
+            println!("{}", "Filename cannot contain '/' or null characters.".yellow());
+            continue;
+        }
+
+        let path = Path::new(&candidate);
+        if path.is_dir() {
+            println!("{}", "That name points to a directory. Choose a file name.".yellow());
+            continue;
+        }
+
+        if path.exists() {
+            let meta_file = format!("{}.pget", candidate);
+            if Path::new(&meta_file).exists() {
+                println!("{}", "Found resumable state for this file. Will resume.".bright_cyan());
+                return candidate;
+            }
+
+            print!("File already exists. Overwrite? [y/N]: ");
+            stdout().flush().unwrap();
+
+            let mut confirm = String::new();
+            stdin().read_line(&mut confirm).unwrap();
+
+            if matches!(confirm.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                return candidate;
+            }
+
+            println!("{}", "Okay, choose a different filename.".yellow());
+            continue;
+        }
+
+        return candidate;
     }
 }
 
