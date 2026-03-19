@@ -198,3 +198,14 @@ Run formatting and lint checks:
 cargo fmt
 cargo clippy --all-targets --all-features
 ```
+
+## Todo
+
+[] Improve CLI ergonomics: add `--output/-o`, `--no-prompt`, and fuller `--help`
+[] Harden reliability: retries with backoff, request timeouts, and graceful error handling
+[] Strengthen resume safety: store/validate `ETag` or `Last-Modified` in `.pget` state
+[] Add integrity checks: optional `--checksum` verification after download
+[] Expand transfer controls: `--limit-rate`, overwrite/skip policies, explicit continue modes
+[] Support auth/customization: custom headers, bearer/basic auth, and proxy support
+[] Improve automation UX: `--quiet`, `--json-progress`, and cleaner verbose logs
+[] Add test + CI coverage: range/no-range, resume, retries, and interruption scenarios
