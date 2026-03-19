@@ -1,6 +1,6 @@
 [package]
 name = "pget"
-version = "0.3.0"
+version = "1.0"
 edition = "2024"
 
 [dependencies]
@@ -8,6 +8,8 @@ reqwest = { version = "0.11", default-features = false, features = ["rustls-tls"
 tokio = { version = "1", features = ["full"] }
 futures-util = "0.3"
 colored = "2"
+md-5 = "0.10"
+sha2 = "0.10"
 
 [profile.release]
 lto = true

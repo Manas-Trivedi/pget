@@ -1,10 +1,14 @@
 use colored::*;
 use futures_util::StreamExt;
+use md5::Md5;
 use reqwest::Client;
+use reqwest::header::{ETAG, HeaderMap, LAST_MODIFIED};
+use sha2::{Digest, Sha256, Sha512};
 use std::collections::{HashSet, VecDeque};
+use std::fs::File;
 use std::io::SeekFrom;
 use std::io::{Error as IoError, ErrorKind};
-use std::io::{Write, stdin, stdout};
+use std::io::{Read, Write, stdin, stdout};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -49,6 +53,7 @@ Arguments:
 
 Options:
   -o, --output <path>   Write to the given output path
+      --checksum <spec> Verify the completed file (md5|sha256|sha512:<hex>)
       --no-prompt       Use the detected filename without prompting
   -t, --threads <n>     Number of worker threads for range downloads (default: 4)
   -v, --verbose         Show per-worker progress output
@@ -62,6 +67,7 @@ Notes:
 
 Examples:
   pget https://example.com/archive.zip
+  pget https://example.com/archive.zip --checksum sha256:0123abcd
   pget https://example.com/archive.zip --no-prompt
   pget https://example.com/archive.zip -o ./downloads/archive.zip
   pget https://example.com/archive.zip -t 8 -v",
@@ -72,14 +78,106 @@ Examples:
 struct CliArgs {
     url: String,
     output: Option<PathBuf>,
+    checksum: Option<ChecksumSpec>,
     no_prompt: bool,
     threads: usize,
     verbose: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ResumeValidator {
+    kind: &'static str,
+    value: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ChecksumAlgorithm {
+    Md5,
+    Sha256,
+    Sha512,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ChecksumSpec {
+    algorithm: ChecksumAlgorithm,
+    expected_hex: String,
+}
+
+#[derive(Clone, Debug)]
+struct ProbeResult {
+    supports_range: bool,
+    file_size: u64,
+    validator: Option<ResumeValidator>,
+}
+
+#[derive(Debug)]
+struct DownloadState {
+    file_size: u64,
+    piece_size: u64,
+    completed: HashSet<u64>,
+    validator: Option<ResumeValidator>,
+}
+
+impl std::str::FromStr for ChecksumSpec {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (algorithm, expected_hex) = value
+            .split_once(':')
+            .ok_or_else(|| "Checksum must use the format <algorithm>:<hex>".to_string())?;
+
+        let algorithm = match algorithm.to_ascii_lowercase().as_str() {
+            "md5" => ChecksumAlgorithm::Md5,
+            "sha256" => ChecksumAlgorithm::Sha256,
+            "sha512" => ChecksumAlgorithm::Sha512,
+            _ => {
+                return Err(format!(
+                    "Unsupported checksum algorithm: {algorithm}. Use md5, sha256, or sha512"
+                ));
+            }
+        };
+
+        let expected_hex = expected_hex.trim().to_ascii_lowercase();
+        let expected_len = match algorithm {
+            ChecksumAlgorithm::Md5 => 32,
+            ChecksumAlgorithm::Sha256 => 64,
+            ChecksumAlgorithm::Sha512 => 128,
+        };
+
+        if expected_hex.len() != expected_len
+            || !expected_hex.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            return Err(format!(
+                "Invalid checksum for {}: expected {expected_len} hex characters",
+                match algorithm {
+                    ChecksumAlgorithm::Md5 => "md5",
+                    ChecksumAlgorithm::Sha256 => "sha256",
+                    ChecksumAlgorithm::Sha512 => "sha512",
+                }
+            ));
+        }
+
+        Ok(Self {
+            algorithm,
+            expected_hex,
+        })
+    }
+}
+
+impl ChecksumSpec {
+    fn label(&self) -> &'static str {
+        match self.algorithm {
+            ChecksumAlgorithm::Md5 => "md5",
+            ChecksumAlgorithm::Sha256 => "sha256",
+            ChecksumAlgorithm::Sha512 => "sha512",
+        }
+    }
+}
+
 fn parse_args(args: &[String]) -> Result<CliArgs, String> {
     let mut url: Option<String> = None;
     let mut output: Option<PathBuf> = None;
+    let mut checksum: Option<ChecksumSpec> = None;
     let mut no_prompt = false;
     let mut threads = 4usize;
     let mut verbose = false;
@@ -120,6 +218,13 @@ fn parse_args(args: &[String]) -> Result<CliArgs, String> {
                 output = Some(PathBuf::from(value));
                 i += 2;
             }
+            "--checksum" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "Missing value for --checksum".to_string())?;
+                checksum = Some(value.parse()?);
+                i += 2;
+            }
             value if value.starts_with('-') => {
                 return Err(format!("Unknown flag: {value}"));
             }
@@ -138,6 +243,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, String> {
     Ok(CliArgs {
         url,
         output,
+        checksum,
         no_prompt,
         threads,
         verbose,
@@ -178,7 +284,8 @@ fn prepare_output_path(path: PathBuf, allow_prompt: bool) -> Result<PathBuf, Str
         if meta_path.exists() {
             println!(
                 "{}",
-                "Found resumable state for this file. Will resume.".bright_cyan()
+                "Found resumable state for this file. Validation will run before resume."
+                    .bright_cyan()
             );
             return Ok(path);
         }
@@ -242,18 +349,129 @@ fn ask_filename(default: &str) -> String {
     }
 }
 
-fn save_state(meta_file: &str, completed: &HashSet<u64>, file_size: u64) {
+fn piece_bounds(piece_index: u64, file_size: u64) -> Option<(u64, u64)> {
+    let start = piece_index.checked_mul(PIECE_SIZE)?;
+    if start >= file_size {
+        return None;
+    }
+    let end = (start + PIECE_SIZE - 1).min(file_size - 1);
+    Some((start, end))
+}
+
+fn completed_bytes(completed: &HashSet<u64>, file_size: u64) -> u64 {
+    completed
+        .iter()
+        .filter_map(|piece_index| piece_bounds(*piece_index, file_size))
+        .map(|(start, end)| end - start + 1)
+        .sum()
+}
+
+fn resume_validator_from_headers(headers: &HeaderMap) -> Option<ResumeValidator> {
+    if let Some(etag) = headers.get(ETAG).and_then(|value| value.to_str().ok()) {
+        return Some(ResumeValidator {
+            kind: "etag",
+            value: etag.to_string(),
+        });
+    }
+
+    headers
+        .get(LAST_MODIFIED)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| ResumeValidator {
+            kind: "last_modified",
+            value: value.to_string(),
+        })
+}
+
+fn parse_state(content: &str) -> Result<DownloadState, String> {
+    let mut file_size = None;
+    let mut piece_size = None;
+    let mut completed = HashSet::new();
+    let mut validator_kind = None;
+    let mut validator_value = None;
+
+    for line in content.lines() {
+        if let Some(value) = line.strip_prefix("file_size=") {
+            file_size = Some(
+                value
+                    .parse::<u64>()
+                    .map_err(|_| "Invalid file_size in state file".to_string())?,
+            );
+        } else if let Some(value) = line.strip_prefix("piece_size=") {
+            piece_size = Some(
+                value
+                    .parse::<u64>()
+                    .map_err(|_| "Invalid piece_size in state file".to_string())?,
+            );
+        } else if let Some(value) = line.strip_prefix("completed=") {
+            for piece in value.split(',').filter(|piece| !piece.is_empty()) {
+                completed.insert(
+                    piece
+                        .parse::<u64>()
+                        .map_err(|_| "Invalid completed piece in state file".to_string())?,
+                );
+            }
+        } else if let Some(value) = line.strip_prefix("validator_kind=") {
+            validator_kind = Some(value.to_string());
+        } else if let Some(value) = line.strip_prefix("validator_value=") {
+            validator_value = Some(value.to_string());
+        }
+    }
+
+    let file_size = file_size.ok_or_else(|| "Missing file_size in state file".to_string())?;
+    let piece_size = piece_size.ok_or_else(|| "Missing piece_size in state file".to_string())?;
+
+    let validator = match (validator_kind, validator_value) {
+        (Some(kind), Some(value)) => {
+            let kind = match kind.as_str() {
+                "etag" => "etag",
+                "last_modified" => "last_modified",
+                _ => return Err(format!("Unsupported validator kind in state file: {kind}")),
+            };
+            Some(ResumeValidator { kind, value })
+        }
+        (None, None) => None,
+        _ => return Err("State file validator is incomplete".to_string()),
+    };
+
+    Ok(DownloadState {
+        file_size,
+        piece_size,
+        completed,
+        validator,
+    })
+}
+
+fn load_state(meta_file: &str) -> Result<Option<DownloadState>, String> {
+    match std::fs::read_to_string(meta_file) {
+        Ok(content) => parse_state(&content).map(Some),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(format!("Failed to read state file: {err}")),
+    }
+}
+
+fn save_state(
+    meta_file: &str,
+    completed: &HashSet<u64>,
+    file_size: u64,
+    validator: Option<&ResumeValidator>,
+) {
     let mut list: Vec<String> = completed.iter().map(|v| v.to_string()).collect();
     list.sort();
 
-    let data = format!(
-        "file_size={}\npiece_size={}\ncompleted={}",
-        file_size,
-        PIECE_SIZE,
-        list.join(",")
-    );
+    let mut lines = vec![
+        format!("file_size={file_size}"),
+        format!("piece_size={PIECE_SIZE}"),
+    ];
 
-    let _ = std::fs::write(meta_file, data);
+    if let Some(validator) = validator {
+        lines.push(format!("validator_kind={}", validator.kind));
+        lines.push(format!("validator_value={}", validator.value));
+    }
+
+    lines.push(format!("completed={}", list.join(",")));
+
+    let _ = std::fs::write(meta_file, lines.join("\n"));
 }
 
 fn app_error(message: impl Into<String>) -> Box<dyn std::error::Error + Send + Sync> {
@@ -308,9 +526,10 @@ async fn send_request(
     Err(last_error.unwrap_or_else(|| app_error(format!("{context} failed"))))
 }
 
-async fn probe_server(client: &Client, url: &str) -> AppResult<(bool, u64)> {
+async fn probe_server(client: &Client, url: &str) -> AppResult<ProbeResult> {
     let resp = send_request(client, url, Some((0, 0)), "Range probe").await?;
     let supports_range = resp.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+    let validator = resume_validator_from_headers(resp.headers());
 
     let file_size = if supports_range {
         let content_range = resp
@@ -332,7 +551,86 @@ async fn probe_server(client: &Client, url: &str) -> AppResult<(bool, u64)> {
             .parse::<u64>()?
     };
 
-    Ok((supports_range, file_size))
+    Ok(ProbeResult {
+        supports_range,
+        file_size,
+        validator,
+    })
+}
+
+fn should_resume(state: &DownloadState, probe: &ProbeResult) -> Result<bool, String> {
+    if state.file_size != probe.file_size {
+        return Ok(false);
+    }
+
+    if state.piece_size != PIECE_SIZE {
+        return Ok(false);
+    }
+
+    match (&state.validator, &probe.validator) {
+        (Some(saved), Some(current)) => Ok(saved == current),
+        (Some(_), None) => Err(
+            "Remote server no longer exposes ETag or Last-Modified; refusing unsafe resume"
+                .to_string(),
+        ),
+        (None, Some(_)) => Ok(false),
+        (None, None) => Err(
+            "Resume state does not contain ETag or Last-Modified; refusing unsafe resume"
+                .to_string(),
+        ),
+    }
+}
+
+fn verify_checksum(path: &str, checksum: &ChecksumSpec) -> AppResult<()> {
+    let mut file = File::open(path)?;
+    let mut buf = [0u8; 64 * 1024];
+
+    let actual = match checksum.algorithm {
+        ChecksumAlgorithm::Md5 => {
+            let mut hasher = Md5::new();
+            loop {
+                let read = file.read(&mut buf)?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buf[..read]);
+            }
+            format!("{:x}", hasher.finalize())
+        }
+        ChecksumAlgorithm::Sha256 => {
+            let mut hasher = Sha256::new();
+            loop {
+                let read = file.read(&mut buf)?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buf[..read]);
+            }
+            format!("{:x}", hasher.finalize())
+        }
+        ChecksumAlgorithm::Sha512 => {
+            let mut hasher = Sha512::new();
+            loop {
+                let read = file.read(&mut buf)?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buf[..read]);
+            }
+            format!("{:x}", hasher.finalize())
+        }
+    };
+
+    if actual == checksum.expected_hex {
+        return Ok(());
+    }
+
+    Err(app_error(format!(
+        "{} mismatch: expected {}, got {}",
+        checksum.label(),
+        checksum.expected_hex,
+        actual
+    )))
 }
 
 async fn download_single_stream(
@@ -558,6 +856,7 @@ async fn main() -> AppResult<()> {
     };
 
     let url = cli.url.clone();
+    let checksum = cli.checksum.clone();
     let default_name = filename_from_url(&url);
     log(&format!("Detected filename: {}", default_name));
     let filename = if let Some(path) = cli.output.clone() {
@@ -580,28 +879,47 @@ async fn main() -> AppResult<()> {
 
     let client = Client::builder().connect_timeout(CONNECT_TIMEOUT).build()?;
 
-    let (supports_range, file_size) = probe_server(&client, &url).await?;
+    let probe = probe_server(&client, &url).await?;
+    let supports_range = probe.supports_range;
+    let file_size = probe.file_size;
 
     log(&format!("File size: {} bytes", file_size));
     log(&format!("Range supported: {}", supports_range));
+    if let Some(validator) = &probe.validator {
+        log(&format!(
+            "Resume validator: {}={}",
+            validator.kind, validator.value
+        ));
+    } else {
+        log("Resume validator: unavailable");
+    }
 
-    // load previous state if exists
-    if let Ok(content) = std::fs::read_to_string(&meta_file) {
-        log("Resuming previous download");
-        for line in content.lines() {
-            if line.starts_with("completed=") {
-                let pieces = line.replace("completed=", "");
-                for p in pieces.split(',') {
-                    if let Ok(id) = p.parse::<u64>() {
-                        completed.lock().unwrap().insert(id);
-                    }
-                }
+    if let Some(state) = load_state(&meta_file)? {
+        match should_resume(&state, &probe) {
+            Ok(true) => {
+                log("Resuming previous download");
+                *completed.lock().unwrap() = state.completed;
+            }
+            Ok(false) => {
+                log("Existing state does not match the remote file. Restarting from scratch.");
+                let _ = std::fs::remove_file(&meta_file);
+            }
+            Err(reason) => {
+                log(&format!("{reason}. Restarting from scratch."));
+                let _ = std::fs::remove_file(&meta_file);
             }
         }
     }
 
-    let completed_count = completed.lock().unwrap().len() as u64;
-    let resumed_bytes = completed_count * PIECE_SIZE;
+    if !supports_range && Path::new(&meta_file).exists() {
+        completed.lock().unwrap().clear();
+        let _ = std::fs::remove_file(&meta_file);
+    }
+
+    let resumed_bytes = {
+        let guard = completed.lock().unwrap();
+        completed_bytes(&guard, file_size)
+    };
 
     if resumed_bytes > 0 {
         log(&format!(
@@ -610,7 +928,6 @@ async fn main() -> AppResult<()> {
         ));
     }
 
-    // Fallback single-thread download
     if !supports_range {
         log("Server does not support range requests — falling back to single-thread download");
 
@@ -667,8 +984,14 @@ async fn main() -> AppResult<()> {
         print!("\x1b[?25h");
         stdout().flush().unwrap();
 
-        println!("\nDownload complete");
+        if let Some(checksum) = &checksum {
+            log(&format!("Verifying {} checksum", checksum.label()));
+            verify_checksum(&filename, checksum)?;
+            log("Checksum verified");
+        }
 
+        let _ = std::fs::remove_file(&meta_file);
+        println!("\nDownload complete");
         return Ok(());
     }
 
@@ -685,7 +1008,6 @@ async fn main() -> AppResult<()> {
     print!("\x1b[?25l");
     stdout().flush().unwrap();
 
-    // Renderer
     tokio::spawn(async move {
         loop {
             let elapsed = start_time.elapsed().as_secs_f64();
@@ -754,7 +1076,6 @@ async fn main() -> AppResult<()> {
         }
     });
 
-    // create file and preallocate size
     let file = OpenOptions::new()
         .create(true)
         .write(true)
@@ -765,13 +1086,19 @@ async fn main() -> AppResult<()> {
 
     let completed_ctrl = completed.clone();
     let meta_ctrl = meta_file.clone();
+    let probe_ctrl = probe.clone();
 
     tokio::spawn(async move {
         match tokio::signal::ctrl_c().await {
             Ok(()) => {
                 println!();
                 log("Interrupted — saving progress");
-                save_state(&meta_ctrl, &completed_ctrl.lock().unwrap(), file_size);
+                save_state(
+                    &meta_ctrl,
+                    &completed_ctrl.lock().unwrap(),
+                    file_size,
+                    probe_ctrl.validator.as_ref(),
+                );
                 print!("\x1b[?25h");
                 stdout().flush().unwrap();
                 std::process::exit(0);
@@ -784,7 +1111,6 @@ async fn main() -> AppResult<()> {
 
     let mut handles = vec![];
 
-    // create range queue
     let ranges = Arc::new(Mutex::new(VecDeque::<(u64, u64, u64)>::new()));
     {
         let mut q = ranges.lock().unwrap();
@@ -809,6 +1135,7 @@ async fn main() -> AppResult<()> {
         let ranges = ranges.clone();
         let completed = completed.clone();
         let meta_file = meta_file.clone();
+        let validator = probe.validator.clone();
 
         let handle = tokio::spawn(async move {
             loop {
@@ -832,7 +1159,12 @@ async fn main() -> AppResult<()> {
                 .await?;
 
                 completed.lock().unwrap().insert(piece_index);
-                save_state(&meta_file, &completed.lock().unwrap(), file_size);
+                save_state(
+                    &meta_file,
+                    &completed.lock().unwrap(),
+                    file_size,
+                    validator.as_ref(),
+                );
             }
             Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
         });
@@ -846,7 +1178,12 @@ async fn main() -> AppResult<()> {
                 for pending in handles {
                     pending.abort();
                 }
-                save_state(&meta_file, &completed.lock().unwrap(), file_size);
+                save_state(
+                    &meta_file,
+                    &completed.lock().unwrap(),
+                    file_size,
+                    probe.validator.as_ref(),
+                );
                 print!("\x1b[?25h");
                 stdout().flush().unwrap();
                 return Err(app_error(format!(
@@ -858,7 +1195,12 @@ async fn main() -> AppResult<()> {
                 for pending in handles {
                     pending.abort();
                 }
-                save_state(&meta_file, &completed.lock().unwrap(), file_size);
+                save_state(
+                    &meta_file,
+                    &completed.lock().unwrap(),
+                    file_size,
+                    probe.validator.as_ref(),
+                );
                 print!("\x1b[?25h");
                 stdout().flush().unwrap();
                 return Err(app_error(format!(
@@ -872,9 +1214,54 @@ async fn main() -> AppResult<()> {
     print!("\x1b[?25h");
     stdout().flush().unwrap();
 
+    if let Some(checksum) = &checksum {
+        log(&format!("Verifying {} checksum", checksum.label()));
+        if let Err(err) = verify_checksum(&filename, checksum) {
+            let _ = std::fs::remove_file(&meta_file);
+            return Err(err);
+        }
+        log("Checksum verified");
+    }
+
     let _ = std::fs::remove_file(meta_file);
 
     println!("\nDownload complete");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_checksum_spec() {
+        let parsed: ChecksumSpec =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .parse()
+                .unwrap();
+
+        assert_eq!(parsed.label(), "sha256");
+    }
+
+    #[test]
+    fn parses_state_with_validator() {
+        let state = parse_state(
+            "file_size=10\npiece_size=4194304\nvalidator_kind=etag\nvalidator_value=\"abc\"\ncompleted=0,1",
+        )
+        .unwrap();
+
+        assert_eq!(state.file_size, 10);
+        assert_eq!(state.validator.unwrap().kind, "etag");
+        assert!(state.completed.contains(&0));
+        assert!(state.completed.contains(&1));
+    }
+
+    #[test]
+    fn completed_bytes_counts_tail_piece_precisely() {
+        let completed = HashSet::from([0, 2]);
+        let file_size = PIECE_SIZE * 2 + 123;
+
+        assert_eq!(completed_bytes(&completed, file_size), PIECE_SIZE + 123);
+    }
 }

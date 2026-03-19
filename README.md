@@ -172,6 +172,12 @@ cargo run -- https://example.com/archive.zip --threads 8
 
 If a matching `<filename>.pget` state file exists, `pget` reloads completed piece indices and continues from remaining ranges.
 
+Verify a completed download with a checksum:
+
+```bash
+cargo run -- https://example.com/archive.zip --checksum sha256:0123abcd...
+```
+
 ## CLI Behavior
 
 1. Derives a default output filename from the input URL unless `-o/--output` is provided.
@@ -186,16 +192,17 @@ If a matching `<filename>.pget` state file exists, `pget` reloads completed piec
 
 3. If `--no-prompt` is used, `pget` accepts the detected filename automatically.
 4. If `-o/--output` is used, `pget` writes to that exact path.
-5. If the target file already exists and a matching sidecar state file exists, `pget` resumes automatically.
+5. If the target file already exists and a matching sidecar state file exists, `pget` validates the saved `ETag` or `Last-Modified` against the current remote file before resuming.
 6. If the target file already exists without resumable state:
    - interactive mode asks for overwrite confirmation
    - `--no-prompt` exits safely instead of overwriting
 7. Probes server byte-range support.
 8. Reports resolved file size and range capability.
 9. If segmented mode is selected, initializes a `4 MiB` piece queue and dispatches pieces across `N` workers (`-t/--threads`).
-10. If interrupted in segmented mode, persists completed piece indices to `<filename>.pget`.
-11. On restart, reloads sidecar state and skips completed pieces.
-12. Renders progress continuously until completion and removes the sidecar state file when done.
+10. If interrupted in segmented mode, persists completed piece indices plus the selected resume validator to `<filename>.pget`.
+11. On restart, reloads sidecar state, verifies it still matches the remote file, and skips completed pieces only when that check succeeds.
+12. Optionally verifies the finished file with `--checksum <algorithm>:<hex>`.
+13. Renders progress continuously until completion and removes the sidecar state file when done.
 
 Rename prompt behavior:
 
@@ -226,6 +233,7 @@ Arguments:
 
 Options:
   -o, --output <path>   Write to the given output path
+      --checksum <spec> Verify the completed file (md5|sha256|sha512:<hex>)
       --no-prompt       Use the detected filename without prompting
   -t, --threads <n>     Number of worker threads for range downloads (default: 4)
   -v, --verbose         Show per-worker progress output
@@ -242,7 +250,9 @@ Flag note:
 
 - Default worker count is `4` when `-t/--threads` is not specified.
 - Segmented mode uses fixed-size `4 MiB` pieces and a shared queue for work distribution.
-- Resume state is stored in `<filename>.pget` and cleaned up after successful completion.
+- Resume state is stored in `<filename>.pget`, including `file_size`, `piece_size`, completed piece indices, and either `ETag` or `Last-Modified` when the server provides one.
+- If saved resume metadata no longer matches the current remote file, `pget` restarts from scratch instead of resuming unsafely.
+- `--checksum` supports `md5`, `sha256`, and `sha512` using the format `<algorithm>:<hex>`.
 - In segmented mode, the output file is preallocated to enable random-access writes.
 - The progress renderer updates in-place and temporarily hides the terminal cursor during transfer.
 - `--output/-o` may include a path, not just a bare filename.
@@ -267,8 +277,8 @@ cargo clippy --all-targets --all-features
 
 - [x] Improve CLI ergonomics: add `--output/-o`, `--no-prompt`, and fuller `--help`
 - [x] Harden reliability: retries with backoff, request timeouts, and graceful error handling
-- [ ] Strengthen resume safety: store/validate `ETag` or `Last-Modified` in `.pget` state
-- [ ] Add integrity checks: optional `--checksum` verification after download
+- [x] Strengthen resume safety: store/validate `ETag` or `Last-Modified` in `.pget` state
+- [x] Add integrity checks: optional `--checksum` verification after download
 - [ ] Expand transfer controls: `--limit-rate`, overwrite/skip policies, explicit continue modes
 - [ ] Support auth/customization: custom headers, bearer/basic auth, and proxy support
 - [ ] Improve automation UX: `--quiet`, `--json-progress`, and cleaner verbose logs
