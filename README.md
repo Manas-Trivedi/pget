@@ -22,6 +22,7 @@ The CLI provides a live progress renderer (throughput and ETA), interactive or n
 - Interrupt handling (`Ctrl+C`) with on-exit progress state persistence
 - Request retries with exponential backoff for probe, single-stream, and ranged piece requests
 - Request/connect timeout handling to avoid indefinite hangs on stalled connections
+- Optional TLS bypass mode for misconfigured endpoints via `--insecure`
 - Live progress telemetry:
 	- bytes transferred
 	- effective throughput
@@ -178,6 +179,12 @@ Verify a completed download with a checksum:
 cargo run -- https://example.com/archive.zip --checksum sha256:0123abcd...
 ```
 
+Bypass TLS certificate validation (unsafe, use only when necessary):
+
+```bash
+cargo run -- https://example.com/archive.zip --insecure
+```
+
 ## CLI Behavior
 
 1. Derives a default output filename from the input URL unless `-o/--output` is provided.
@@ -202,7 +209,8 @@ cargo run -- https://example.com/archive.zip --checksum sha256:0123abcd...
 10. If interrupted in segmented mode, persists completed piece indices plus the selected resume validator to `<filename>.pget`.
 11. On restart, reloads sidecar state, verifies it still matches the remote file, and skips completed pieces only when that check succeeds.
 12. Optionally verifies the finished file with `--checksum <algorithm>:<hex>`.
-13. Renders progress continuously until completion and removes the sidecar state file when done.
+13. If `--insecure` is set, TLS certificate validation is disabled for this run.
+14. Renders progress continuously until completion and removes the sidecar state file when done.
 
 Rename prompt behavior:
 
@@ -235,6 +243,7 @@ Options:
   -o, --output <path>   Write to the given output path
       --checksum <spec> Verify the completed file (md5|sha256|sha512:<hex>)
       --no-prompt       Use the detected filename without prompting
+      --insecure        Disable TLS certificate validation (unsafe)
   -t, --threads <n>     Number of worker threads for range downloads (default: 4)
   -v, --verbose         Show per-worker progress output
       --help            Show this help text
@@ -257,6 +266,7 @@ Flag note:
 - The progress renderer updates in-place and temporarily hides the terminal cursor during transfer.
 - `--output/-o` may include a path, not just a bare filename.
 - `--no-prompt` is automation-friendly but intentionally refuses to overwrite an existing non-resumable file.
+- `--insecure` disables TLS certificate verification and should only be used for trusted endpoints in controlled environments.
 
 ## Development
 
