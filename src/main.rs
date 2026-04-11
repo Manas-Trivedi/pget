@@ -82,6 +82,7 @@ struct CliArgs {
     no_prompt: bool,
     threads: usize,
     verbose: bool,
+    insecure: bool
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -181,6 +182,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, String> {
     let mut no_prompt = false;
     let mut threads = 4usize;
     let mut verbose = false;
+    let mut insecure = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -225,6 +227,10 @@ fn parse_args(args: &[String]) -> Result<CliArgs, String> {
                 checksum = Some(value.parse()?);
                 i += 2;
             }
+            "--insecure" => {
+                insecure = true;
+                i += 1;
+            }
             value if value.starts_with('-') => {
                 return Err(format!("Unknown flag: {value}"));
             }
@@ -247,6 +253,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, String> {
         no_prompt,
         threads,
         verbose,
+        insecure
     })
 }
 
@@ -520,6 +527,15 @@ async fn send_request(
                 delay.as_secs_f64()
             ));
             tokio::time::sleep(delay).await;
+        }
+    }
+
+    if let Some(err) = &last_error {
+        let msg = err.to_string().to_lowercase();
+        if msg.contains("certificate") || msg.contains("tls") {
+            return Err(app_error(
+                "TLS certificate validation failed (server may be misconfigured). Try --insecure."
+            ));
         }
     }
 
@@ -877,7 +893,14 @@ async fn main() -> AppResult<()> {
     let verbose = cli.verbose;
     let chunks = cli.threads;
 
-    let client = Client::builder().connect_timeout(CONNECT_TIMEOUT).build()?;
+    let mut builder = Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT);
+
+    if cli.insecure {
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+
+    let client = builder.build()?;
 
     let probe = probe_server(&client, &url).await?;
     let supports_range = probe.supports_range;
